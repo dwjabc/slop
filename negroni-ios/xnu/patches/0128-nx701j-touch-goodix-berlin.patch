@@ -1,0 +1,396 @@
+diff --git a/bsd/dev/negroni_touch.c b/bsd/dev/negroni_touch.c
+index f2d8d24..f3b7486 100644
+--- a/bsd/dev/negroni_touch.c
++++ b/bsd/dev/negroni_touch.c
+@@ -1,11 +1,10 @@
+ /*
+- * NEGRONI Synaptics S3908 (TouchComm, I2C 0x4b) touch.
+- * QUP0 SE4 has its FIFO disabled (GPI only, DMA block secure-locked), so the
+- * bus is open-drain GPIO16/17 I2C, the same code as Mu's NegroniTouchDxe
+- * (bsd/dev/negroni_touch/ = ios-sweet drivers/negroni-touch). Mu powers the
+- * panel (L6C, L3C, 1.8 V switch) and leaves it on; this thread polls ATTN
+- * (GPIO21, active low) every 10 ms and reports fingers to NegroniHIDTouch.
+- * Call once after the scheduler is running.
++ * NEGRONI Goodix GT9916 (Berlin, I2C 0x5d) touch for the ZTE Nubia Z40 Pro
++ * (nx701j). Same wiring as the S3908 board this file started from: QUP0 SE4
++ * has its FIFO disabled (GPI only, DMA block secure-locked), so the bus is
++ * open-drain GPIO16/17 I2C; reset GPIO20, ATTN GPIO21 (active low), panel
++ * power (L8C) left on by Mu. This thread polls ATTN every 10 ms and reports
++ * fingers to NegroniHIDTouch. Call once after the scheduler is running.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -18,7 +17,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ #include "negroni_touch/tlmm_i2c.h"
+-#include "negroni_touch/syna_tcm.h"
++#include "negroni_touch/goodix_berlin.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -30,10 +29,10 @@ void negroni_touch_init(void);
+ #define TOUCH_PINS_PA   (TLMM_BASE + TLMM_CTL(NT_PIN_I2C_SDA))
+ #define TOUCH_PINS_LEN  0x8000u
+ #define TOUCH_PIN(n)    ((uint32_t)((n) - NT_PIN_I2C_SDA) * 0x1000u)
+-#define S3908_ADDR      0x4b
+-/* panel (5760x12864, touchpanel,panel-coords) to display pixels */
++#define TOUCH_PANEL_MAX_X 1080u
++#define TOUCH_PANEL_MAX_Y 2400u
+ #define TOUCH_W         1080
+-#define TOUCH_H         2412
++#define TOUCH_H         2400
+ 
+ static struct {
+ 	bool started;
+@@ -41,9 +40,10 @@ static struct {
+ 	vm_offset_t pins;
+ 	struct tlmm_i2c line;
+ 	struct gpio_i2c bus;
+-	struct tcm tcm;
++	struct gb gb;
++	struct gb_point pts[GB_MAX_TOUCH];
+ 	uint32_t active;
+-	int x[TCM_MAX_OBJECTS], y[TCM_MAX_OBJECTS];
++	int x[GB_MAX_TOUCH], y[GB_MAX_TOUCH];
+ } st;
+ 
+ static void
+@@ -52,12 +52,6 @@ touch_udelay(unsigned us)
+ 	delay((int)us);
+ }
+ 
+-static void
+-touch_wait_1ms(void)
+-{
+-	IOSleep(1);
+-}
+-
+ static int
+ touch_attn(void)
+ {
+@@ -67,13 +61,13 @@ touch_attn(void)
+ static int
+ touch_i2c_read(void *ctx, uint8_t *buf, uint32_t len)
+ {
+-	return gpio_i2c_read(ctx, S3908_ADDR, buf, len);
++	return gpio_i2c_read(ctx, GB_ADDR, buf, len);
+ }
+ 
+ static int
+ touch_i2c_write(void *ctx, const uint8_t *buf, uint32_t len)
+ {
+-	return gpio_i2c_write(ctx, S3908_ADDR, buf, len);
++	return gpio_i2c_write(ctx, GB_ADDR, buf, len);
+ }
+ 
+ static void
+@@ -81,15 +75,15 @@ touch_report(void)
+ {
+ 	uint32_t mask = 0;
+ 
+-	for (unsigned id = 0; id < TCM_MAX_OBJECTS; ++id) {
+-		const struct tcm_object *o = &st.tcm.obj[id];
++	for (unsigned id = 0; id < GB_MAX_TOUCH; ++id) {
++		const struct gb_point *p = &st.pts[id];
+ 		uint32_t bit = 1u << id;
+ 
+-		if (o->status == 0) {
++		if (!(p->status & 0x80u)) {
+ 			continue;
+ 		}
+-		int x = (int)((uint64_t)MIN(o->x, TCM_PANEL_MAX_X - 1) * TOUCH_W / TCM_PANEL_MAX_X);
+-		int y = (int)((uint64_t)MIN(o->y, TCM_PANEL_MAX_Y - 1) * TOUCH_H / TCM_PANEL_MAX_Y);
++		int x = (int)((uint64_t)MIN(p->x, TOUCH_PANEL_MAX_X - 1) * TOUCH_W / TOUCH_PANEL_MAX_X);
++		int y = (int)((uint64_t)MIN(p->y, TOUCH_PANEL_MAX_Y - 1) * TOUCH_H / TOUCH_PANEL_MAX_Y);
+ 		mask |= bit;
+ 		if (!(st.active & bit) || x != st.x[id] || y != st.y[id]) {
+ 			negroni_hid_touch((int)id, 1, x, y);
+@@ -100,7 +94,7 @@ touch_report(void)
+ 		st.x[id] = x;
+ 		st.y[id] = y;
+ 	}
+-	for (unsigned id = 0; id < TCM_MAX_OBJECTS; ++id) {
++	for (unsigned id = 0; id < GB_MAX_TOUCH; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if ((st.active & bit) && !(mask & bit)) {
+ 			negroni_hid_touch((int)id, 0, st.x[id], st.y[id]);
+@@ -112,30 +106,25 @@ touch_report(void)
+ static void
+ touch_release_all(void)
+ {
+-	for (unsigned id = 0; id < TCM_MAX_OBJECTS; ++id) {
+-		st.tcm.obj[id].status = 0;
+-	}
++	memset(st.pts, 0, sizeof(st.pts));
+ 	touch_report();
+ }
+ 
+-/* Drain pending messages (identify after reset, stale reports), then read the report config. */
++/* Confirm the device, read the firmware version and locate the touch data. */
+ static int
+ touch_setup(void)
+ {
+-	int rc = 1;
+-
+-	for (int i = 0; i < 50 && !touch_attn(); i++) {
+-		rc = tcm_read_message(&st.tcm);
+-		if (rc < 0) {
+-			break;
+-		}
++	int rc = gb_confirm(&st.gb);
++	printf("NEGRONI TOUCH: confirm rc=%d\n", rc);
++	if (rc) {
++		return rc;
++	}
++	rc = gb_read_version(&st.gb);
++	if (rc == 0) {
++		printf("NEGRONI TOUCH: patch pid %.8s\n", (const char *)st.gb.patch_pid);
++		rc = gb_parse_ic_info(&st.gb);
++		printf("NEGRONI TOUCH: ic info rc=%d touch_data=0x%x\n", rc, st.gb.touch_data_addr);
+ 	}
+-	printf("NEGRONI TOUCH: drain rc=%d code=%#x hdr %02x %02x %02x %02x bus=%d attn=%d\n",
+-	    rc, st.tcm.code, st.tcm.header[0], st.tcm.header[1], st.tcm.header[2],
+-	    st.tcm.header[3], st.tcm.transport_error, touch_attn());
+-	rc = tcm_get_report_config(&st.tcm, touch_wait_1ms);
+-	printf("NEGRONI TOUCH: report config rc=%d len=%u bus=%d\n",
+-	    rc, st.tcm.config_len, st.tcm.transport_error);
+ 	return rc;
+ }
+ 
+@@ -147,7 +136,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)result;
+ 
+ 	(void)PE_parse_boot_argn("negronitouchdelay", &delay_s, sizeof(delay_s));
+-	printf("NEGRONI TOUCH: S3908 over GPIO I2C, starting in %u s\n", delay_s);
++	printf("NEGRONI TOUCH: GT9916 over GPIO I2C, starting in %u s\n", delay_s);
+ 	IOSleep(delay_s * 1000u);
+ 	st.pins = ml_io_map(TOUCH_PINS_PA, TOUCH_PINS_LEN);
+ 	if (!st.pins) {
+@@ -156,9 +145,9 @@ touch_thread(void *arg, wait_result_t result)
+ 	}
+ 	st.line.pins = (volatile uint8_t *)st.pins;
+ 	tlmm_i2c_init(&st.bus, &st.line, touch_udelay);
+-	st.tcm.io.ctx = &st.bus;
+-	st.tcm.io.read = touch_i2c_read;
+-	st.tcm.io.write = touch_i2c_write;
++	st.gb.io.ctx = &st.bus;
++	st.gb.io.read = touch_i2c_read;
++	st.gb.io.write = touch_i2c_write;
+ 	printf("NEGRONI TOUCH: reset=%d attn=%d sda=%d scl=%d (Mu leaves the panel powered)\n",
+ 	    (int)((*(volatile uint32_t *)(st.pins + TOUCH_PIN(NT_PIN_RESET) + 4) >> 1) & 1),
+ 	    touch_attn(), ti_get_sda(&st.line), ti_get_scl(&st.line));
+@@ -171,20 +160,19 @@ touch_thread(void *arg, wait_result_t result)
+ 		*rst = TLMM_OUT;
+ 		IOSleep(200);
+ 		if (touch_setup()) {
+-			printf("NEGRONI TOUCH: no report config; stopping\n");
++			printf("NEGRONI TOUCH: no Goodix device; stopping\n");
+ 			goto out;
+ 		}
+ 	}
+-	printf("NEGRONI TOUCH: running, %ux%u -> %ux%u, poll 10 ms on ATTN\n",
+-	    TCM_PANEL_MAX_X, TCM_PANEL_MAX_Y, TOUCH_W, TOUCH_H);
++	printf("NEGRONI TOUCH: running, poll 10 ms on ATTN\n");
+ 
+ 	unsigned errors = 0;
+ 	for (;;) {
+-		for (int n = 0; n < 4 && !touch_attn(); n++) {
+-			int rc = tcm_read_message(&st.tcm);
++		for (int n = 0; n < 4; n++) {
++			int rc = gb_read_event(&st.gb, st.pts, GB_MAX_TOUCH);
+ 			if (rc < 0) {
+ 				if ((errors++ % 100u) == 0) {
+-					printf("NEGRONI TOUCH: read rc=%d bus=%d\n", rc, st.tcm.transport_error);
++					printf("NEGRONI TOUCH: read rc=%d\n", rc);
+ 				}
+ 				if (errors == 10) {
+ 					touch_release_all();
+@@ -192,8 +180,12 @@ touch_thread(void *arg, wait_result_t result)
+ 				break;
+ 			}
+ 			errors = 0;
+-			if (rc == 0 && st.tcm.code == TCM_REPORT_TOUCH && tcm_parse_touch(&st.tcm) == 0) {
+-				touch_report();
++			for (unsigned i = (unsigned)rc; i < GB_MAX_TOUCH; i++) {
++				st.pts[i].status = 0;
++			}
++			touch_report();
++			if (!touch_attn()) {
++				break;
+ 			}
+ 		}
+ 		IOSleep(10);
+diff --git a/bsd/dev/negroni_touch/goodix_berlin.h b/bsd/dev/negroni_touch/goodix_berlin.h
+new file mode 100644
+index 0000000..3528092
+--- /dev/null
++++ b/bsd/dev/negroni_touch/goodix_berlin.h
+@@ -0,0 +1,167 @@
++/*
++ * Goodix Berlin protocol (GT9916) over an I2C bus handle.
++ * Register map per the mainline Linux goodix_berlin driver; the IC boots from
++ * internal flash, so no config/firmware download is needed for plain touch.
++ * nx701j: GT9916 at 0x5d on the SE4 GPIO I2C bus (same pins as the S3908).
++ */
++#ifndef GOODIX_BERLIN_H
++#define GOODIX_BERLIN_H
++
++#include <stdint.h>
++#include <string.h>
++
++#define GB_ADDR             0x5du
++#define GB_BOOTOPTION       0x10000u
++#define GB_DEV_CONFIRM_VAL  0xaau
++#define GB_FW_VERSION_ADDR  0x1000cu  /* A variant */
++#define GB_IC_INFO_ADDR     0x10068u  /* A variant */
++#define GB_IC_INFO_MAX_LEN  512u
++#define GB_MAX_TOUCH        10u
++#define GB_CKSUM_SIZE       2u
++#define GB_HEADER_SIZE      8u
++#define GB_POINT_SIZE       8u
++
++struct gb_io {
++	void *ctx;
++	int (*read)(void *ctx, uint8_t *buf, uint32_t len);
++	int (*write)(void *ctx, const uint8_t *buf, uint32_t len);
++};
++
++struct gb_point {
++	uint8_t status;
++	uint8_t reserved;
++	uint16_t x, y, w;
++};
++
++struct gb {
++	struct gb_io io;
++	uint32_t touch_data_addr;
++	uint8_t patch_pid[8];
++};
++
++static inline int
++gb_write(struct gb *g, uint32_t reg, const uint8_t *buf, uint32_t len)
++{
++	uint8_t tmp[2 + 512];
++	if (len > sizeof(tmp) - 2)
++		return -1;
++	tmp[0] = (uint8_t)(reg >> 8);
++	tmp[1] = (uint8_t)reg;
++	for (uint32_t i = 0; i < len; i++)
++		tmp[2 + i] = buf[i];
++	return g->io.write(g->io.ctx, tmp, 2 + len);
++}
++
++static inline int
++gb_read(struct gb *g, uint32_t reg, uint8_t *buf, uint32_t len)
++{
++	uint8_t ptr[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++	int rc = g->io.write(g->io.ctx, ptr, 2);
++	if (rc)
++		return rc;
++	return g->io.read(g->io.ctx, buf, len);
++}
++
++static inline uint16_t
++gb_cksum(const uint8_t *buf, uint32_t size)
++{
++	uint16_t s = 0;
++	for (uint32_t i = 0; i + GB_CKSUM_SIZE <= size; i++)
++		s = (uint16_t)(s + buf[i]);
++	return s;
++}
++
++/* Write 8x 0xAA to the bootoption register and read it back. */
++static inline int
++gb_confirm(struct gb *g)
++{
++	uint8_t tx[8], rx[8];
++	memset(tx, GB_DEV_CONFIRM_VAL, sizeof(tx));
++	for (int retry = 0; retry < 3; retry++) {
++		int rc = gb_write(g, GB_BOOTOPTION, tx, sizeof(tx));
++		if (rc)
++			return rc;
++		rc = gb_read(g, GB_BOOTOPTION, rx, sizeof(rx));
++		if (rc)
++			return rc;
++		if (memcmp(tx, rx, sizeof(tx)) == 0)
++			return 0;
++	}
++	return -1;
++}
++
++/* 28-byte fw version block at 0x1000C; patch PID at bytes 12..19. */
++static inline int
++gb_read_version(struct gb *g)
++{
++	uint8_t buf[28];
++	int rc = gb_read(g, GB_FW_VERSION_ADDR, buf, sizeof(buf));
++	if (rc)
++		return rc;
++	if (gb_cksum(buf, sizeof(buf)) != (uint16_t)(buf[26] | (buf[27] << 8)))
++		return -2;
++	memcpy(g->patch_pid, buf + 12, 8);
++	return 0;
++}
++
++/* IC info at 0x10068: skip the fixed headers and the variable parameter
++ * lists, then read touch_data_addr out of the misc block. */
++static inline int
++gb_parse_ic_info(struct gb *g)
++{
++	uint8_t buf[GB_IC_INFO_MAX_LEN];
++	int rc = gb_read(g, GB_IC_INFO_ADDR, buf, sizeof(buf));
++	if (rc)
++		return rc;
++
++	uint32_t off = 2;                        /* length le16 */
++	off += 11;                               /* ic_info_version */
++	off += 10;                               /* ic_info_feature */
++	off += 4;                                /* drv/sen/button/force num */
++	if (off >= sizeof(buf))
++		return -3;
++	for (int i = 0; i < 5; i++) {            /* 5x le16 param lists */
++		uint8_t n = buf[off++];
++		off += (uint32_t)n * 2;
++		if (off >= sizeof(buf))
++			return -3;
++	}
++	off += 42;                               /* misc fields before touch_data_addr */
++	if (off + 4 > sizeof(buf))
++		return -3;
++	g->touch_data_addr = (uint32_t)buf[off] | ((uint32_t)buf[off + 1] << 8) |
++	    ((uint32_t)buf[off + 2] << 16) | ((uint32_t)buf[off + 3] << 24);
++	return g->touch_data_addr ? 0 : -4;
++}
++
++/* Read one event at touch_data_addr. Returns the touch count (>=0) with
++ * points filled, 0 when no event, negative on bus/checksum error. */
++static inline int
++gb_read_event(struct gb *g, struct gb_point *pts, unsigned max)
++{
++	uint8_t buf[GB_HEADER_SIZE + GB_POINT_SIZE * GB_MAX_TOUCH + GB_CKSUM_SIZE];
++	int rc = gb_read(g, g->touch_data_addr, buf, sizeof(buf));
++	if (rc)
++		return rc;
++	uint16_t want = (uint16_t)(buf[6] | (buf[7] << 8));
++	if (gb_cksum(buf, sizeof(buf)) != want)
++		return -2;
++	if (!(buf[0] & 0x80u))
++		return 0;                        /* no touch event */
++
++	unsigned count = buf[0] & 0x0fu;
++	if (count > max)
++		count = max;
++	for (unsigned i = 0; i < count; i++) {
++		const uint8_t *p = buf + GB_HEADER_SIZE + i * GB_POINT_SIZE;
++		pts[i].status = p[0];
++		pts[i].x = (uint16_t)(p[2] | (p[3] << 8));
++		pts[i].y = (uint16_t)(p[4] | (p[5] << 8));
++		pts[i].w = (uint16_t)(p[6] | (p[7] << 8));
++	}
++	static const uint8_t zero[4];
++	(void)gb_write(g, g->touch_data_addr, zero, 4);
++	return (int)count;
++}
++
++#endif /* GOODIX_BERLIN_H */
